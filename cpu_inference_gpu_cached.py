@@ -60,6 +60,16 @@ class ModelArgs:
     beta_slow: int = 1
     mscale: float = 1.0
 
+    def get_softmax_scale(self) -> float:
+        """Compute attention softmax scale with YaRN mscale adjustment."""
+        head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        base_scale = head_dim ** -0.5
+        # YaRN mscale adjustment when using extended context
+        if self.max_seq_len > self.original_seq_len:
+            yarn_mscale = 0.1 * self.mscale * math.log(self.rope_factor) + 1.0
+            return base_scale * yarn_mscale * yarn_mscale
+        return base_scale
+
 
 def dequantize_fp8(weight_fp8: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
     """Dequantize FP8 weight to BF16 using block-wise scale."""
@@ -370,7 +380,7 @@ class DeepSeekV32CachedGPU:
             k = torch.cat([k_nope, k_pe_expanded], dim=-1)
             q = torch.cat([q_nope, q_pe], dim=-1)
 
-            scale = (self.args.qk_nope_head_dim + self.args.qk_rope_head_dim) ** -0.5
+            scale = self.args.get_softmax_scale()
             scores = torch.einsum("bshd,bthd->bsht", q.float(), k.float()) * scale
 
             mask = torch.triu(torch.full((seqlen, end_pos), float("-inf"), device=self.device),
@@ -384,7 +394,7 @@ class DeepSeekV32CachedGPU:
             q_nope_proj = torch.einsum("bshd,hdc->bshc", q_nope.float(),
                                         wkv_b_reshaped[:, :self.args.qk_nope_head_dim].float())
 
-            scale = (self.args.qk_nope_head_dim + self.args.qk_rope_head_dim) ** -0.5
+            scale = self.args.get_softmax_scale()
             scores = (torch.einsum("bshc,btc->bsht", q_nope_proj, cached_kv.float()) +
                      torch.einsum("bshr,btr->bsht", q_pe.float(), cached_pe.float())) * scale
 
@@ -530,8 +540,19 @@ class DeepSeekV32CachedGPU:
         return logits
 
     @torch.inference_mode()
-    def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 0.7) -> str:
-        tokens = self.tokenizer.encode(prompt, return_tensors="pt")
+    def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 0.7,
+                 use_chat_format: bool = True, system_prompt: str = None) -> str:
+        if use_chat_format:
+            # Apply chat template for proper formatting
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            formatted = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            # Don't add BOS again - chat template already includes it
+            tokens = self.tokenizer.encode(formatted, add_special_tokens=False, return_tensors="pt")
+        else:
+            tokens = self.tokenizer.encode(prompt, return_tensors="pt")
         seq_len = tokens.shape[1]
 
         print(f"Prompt tokens: {seq_len}")
@@ -586,7 +607,39 @@ class DeepSeekV32CachedGPU:
         return self.tokenizer.decode(full_tokens, skip_special_tokens=True)
 
 
+# Optimized system prompts for math
+SYSTEM_PROMPTS = {
+    "terse": """∀response: |tokens|<50. Format: [reason]→\\boxed{answer}
+Use: ∵(because) ∴(therefore) → ⟹ ≡ ∈ ∀ ∃
+No prose. Symbols only. Skip obvious steps.""",
+
+    "minimal": """Output ONLY: \\boxed{answer}
+No explanation. No steps. Direct result.""",
+
+    "compressed": """Compress reasoning: abbrev+symbols.
+∵=because ∴=therefore →=then ≡=equals
+Max 3 steps. End: \\boxed{result}""",
+
+    "hybrid": """Math solver mode. Rules:
+1. Reasoning: use ∵ ∴ → ⟹ ≡, skip trivial steps
+2. Each step ≤10 words, use notation not prose
+3. Final answer: \\boxed{result}
+4. Total output <80 tokens"""
+}
+
+
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--prompt", "-p", type=str, default="pi=", help="Input prompt")
+    parser.add_argument("--max-tokens", "-n", type=int, default=30, help="Max tokens to generate")
+    parser.add_argument("--temperature", "-t", type=float, default=0.1, help="Sampling temperature")
+    parser.add_argument("--system", "-s", type=str, choices=list(SYSTEM_PROMPTS.keys()) + ["none", "custom"],
+                       default="none", help="System prompt preset")
+    parser.add_argument("--custom-system", type=str, default=None, help="Custom system prompt")
+    parser.add_argument("--no-chat", action="store_true", help="Disable chat template")
+    cli_args = parser.parse_args()
+
     print("=" * 60)
     print("DeepSeek-Math-V2 GPU Compute + Expert Caching")
     print("=" * 60)
@@ -599,11 +652,25 @@ def main():
     args = ModelArgs()
     model = DeepSeekV32CachedGPU(MODEL_PATH, args)
 
-    prompt = "What is 2 + 2?"
+    # Select system prompt
+    system_prompt = None
+    if cli_args.system == "custom" and cli_args.custom_system:
+        system_prompt = cli_args.custom_system
+    elif cli_args.system in SYSTEM_PROMPTS:
+        system_prompt = SYSTEM_PROMPTS[cli_args.system]
+        print(f"\nUsing '{cli_args.system}' system prompt")
+
+    prompt = cli_args.prompt
     print(f"\nPrompt: {prompt}")
     print("-" * 40)
 
-    result = model.generate(prompt, max_new_tokens=20, temperature=0.7)
+    result = model.generate(
+        prompt,
+        max_new_tokens=cli_args.max_tokens,
+        temperature=cli_args.temperature,
+        use_chat_format=not cli_args.no_chat,
+        system_prompt=system_prompt
+    )
     print("-" * 40)
     print(f"Full response: {result}")
 
